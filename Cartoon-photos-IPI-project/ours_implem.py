@@ -3,14 +3,16 @@ import skimage.io
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.cluster import KMeans
+from scipy.ndimage import uniform_filter
 
-def preproc(contentPath):
+def toonify(contentPath):
 
     image = skimage.io.imread(contentPath)
     plt.imshow(image)
     plt.axis('off')
     plt.show()
 
+    image = uniform_filter(image, size=(7, 7, 1)) 
     image = skimage.restoration.denoise_bilateral(image, channel_axis=-1)
     # aplicando filtro bilateral
 
@@ -47,4 +49,4 @@ def preproc(contentPath):
     plt.show()
     return image_reduced
 
-preproc("patoNaLagoa.jpg")
+toonify("golfinho.jpg")
