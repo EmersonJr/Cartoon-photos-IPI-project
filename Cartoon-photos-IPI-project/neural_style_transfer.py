@@ -6,7 +6,7 @@ import scipy.ndimage.filters
 
 import torch
 import torch.optim as optim
-import torch.nn.functional as functional
+import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.autograd import Variable
@@ -31,11 +31,12 @@ class SaveFeatures(torch.nn.Module):
 
 
 def content_loss(yhat):
-    loss = 0
+    global cnt_features
+    _loss = 0
     for i in range(len(yhat)):
-        loss += functional.mse_loss(orig_features[i], yhat[i])
+        _loss += F.mse_loss(cnt_features[i], yhat[i])
     
-    return loss/len(yhat)
+    return _loss/len(yhat)
 
 def gram(x):
     b, c, h, w = x.size()
@@ -43,35 +44,14 @@ def gram(x):
     return torch.mm(x, x.t())
 
 def style_loss(yhat):
-    loss = 0
+    global sty_features
+    _loss = 0
     for i in range(len(yhat)):
-        style_gram = gram(style_features[i])
+        style_gram = gram(sty_features[i])
         ip_gram = gram(yhat[i])
-        loss += functional.mse_loss(style_gram, ip_gram)
+        _loss += F.mse_loss(style_gram, ip_gram)
 
-    return loss/len(yhat)
-
-def step():
-    global optimizer
-
-    c_w = 0.001
-    s_w = 0.001
-    vgg(ip)
-    orig_ip_features = [sf.features.clone() for sf in orig_sfs]
-    style_ip_features = [sf.features.clone() for sf in style_sfs]
-    orig_loss = c_w * content_loss(orig_ip_features)
-    sty_loss = s_w * style_loss(style_ip_features)
-    loss = orig_loss + sty_loss
-    optimizer.zero_grad()
-    loss.backward()
-
-    if i % 100:
-        print("Step - {} Content loss - {}, Style loss - {}, Total loss - {}".format(
-            i, orig_loss.data[0], sty_loss.data[0], loss.data[0]))
-        out_img = ip.data.cpu().squeeze().permute(1, 2, 0).numpy()
-        cv2.imwrite(os.path.join('debug', str(i) + '.png'), out_img*255);
-
-    return loss
+    return _loss/len(yhat)
 
 def read_img(path):
     img = cv2.imread(path)
@@ -92,10 +72,10 @@ def get_imgs(path_orig, path_style):
 
 def neural_style_transfer(orig_path, style_path):
     global vgg
-    global orig_sfs
-    global style_sfs
-    global orig_features
-    global style_features
+    global cnt_sfs
+    global sty_sfs
+    global cnt_features
+    global sty_features
     global ip
     global optimizer
     global i
@@ -108,38 +88,99 @@ def neural_style_transfer(orig_path, style_path):
 
     orig_np, style_np = get_imgs(orig_path, style_path)
 
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    # CORREÇÃO 1: Definir a normalização e aplicá-la corretamente
+    # Note que a normalização espera tensor (C, H, W)
+    norm_mean = [0.485, 0.456, 0.406]
+    norm_std = [0.229, 0.224, 0.225]
+    normalize = transforms.Normalize(mean=norm_mean, std=norm_std)
 
     model = getattr(models, MODEL)
     vgg = model(pretrained=True)
-    orig, style = torch.Tensor(orig_np), torch.Tensor(style_np)
+    
+    # Prepara tensores, envia para GPU e normaliza
+    cnt = torch.tensor(orig_np).float().to(gpu0)
+    cnt = normalize(cnt)
+    
+    style = torch.tensor(style_np).float().to(gpu0)
+    style = normalize(style)
 
     # pegando apenas as camadas convolucionais do VGG-16
-    vgg = torch.nn.Sequential(*list(vgg.features.children())[:43]).cuda()
+    vgg = torch.nn.Sequential(*list(vgg.features.children())[:43]).to(gpu0)
+    
+    # CORREÇÃO 2: Travar o modelo em modo de avaliação (CRUCIAL para VGG_BN)
+    vgg.eval() 
+    
     for param in vgg.parameters():
         param.requires_grad = False
 
     layers = [5, 12, 22]
-    orig_sfs = [SaveFeatures(vgg[i]) for i in layers]
+    cnt_sfs = [SaveFeatures(vgg[i]) for i in layers]
 
     # passa a imagem e pega as features desejadas
-    vgg(Variable(orig[None].to(gpu0)))
-    orig_features = [sf.features.clone() for sf in orig_sfs]
+    # Adiciona dimensão do batch com unsqueeze(0)
+    vgg(cnt.unsqueeze(0))
+    
+    # CORREÇÃO 3: Detach para garantir que o alvo seja constante (boa prática)
+    cnt_features = [sf.features.clone().detach() for sf in cnt_sfs]
 
     layers = [5, 12, 22, 32, 42]
-    style_sfs = [SaveFeatures(vgg[i]) for i in layers]
-    vgg(Variable(style[None].to(gpu0)))
-    style_features = [sf.features.clone() for sf in style_sfs]
+    sty_sfs = [SaveFeatures(vgg[i]) for i in layers]
+    vgg(style.unsqueeze(0))
+    sty_features = [sf.features.clone().detach() for sf in sty_sfs]
 
-    # imagem inicial eh uma aleatoria, com ruido, para treinarmos e igualarmos
+    # Imagem inicial com ruído
     np_ip = np.random.uniform(0.0, 1.0, size=orig_np.shape)
     np_ip = scipy.ndimage.filters.median_filter(np_ip, [8,8,1])
-    ip = torch.Tensor(np_ip)[None].to(gpu0)
-    ip = Variable(ip, requires_grad=True)
+    
+    # Normaliza a imagem de input inicial também
+    ip_tensor = torch.tensor(np_ip).float().to(gpu0)
+    ip_tensor = normalize(ip_tensor)
+    
+    # Habilita gradiente na imagem de entrada
+    ip = ip_tensor.unsqueeze(0).requires_grad_(True)
 
-    optimizer = optim.LBFGS([ip], lr=0.005)
+    optimizer = optim.LBFGS([ip], lr=1) # LR pode precisar de ajuste dependendo da escala
 
     i = 0
-    while i < STEPS:
-        optimizer.step(step)
+    
+    # Função auxiliar para desnormalizar e salvar imagem (para visualização correta)
+    def save_debug_image(tensor_img, step_count):
+        # Desfaz normalização para salvar
+        t_img = tensor_img.clone().detach().cpu().squeeze()
+        
+        # Desnormalização manual: x * std + mean
+        for t, m, s in zip(t_img, norm_mean, norm_std):
+            t.mul_(s).add_(m)
+            
+        out_img = t_img.permute(1, 2, 0).numpy()
+        out_img = np.clip(out_img, 0, 1)
+        cv2.imwrite(os.path.join('debug', str(step_count) + '.png'), out_img * 255)
+
+    # Atualizando a função step para usar o novo salvamento
+    def step_closure():
+        global i
+        c_w = 1e9  # Pesos geralmente precisam ser ajustados
+        s_w = 1e5 # Peso de estilo costuma ser muito maior que conteúdo
+        
+        optimizer.zero_grad()
+        vgg(ip)
+        
+        cnt_ip_features = [sf.features.clone() for sf in cnt_sfs]
+        sty_ip_features = [sf.features.clone() for sf in sty_sfs]
+        
+        cnt_loss = c_w * content_loss(cnt_ip_features)
+        sty_loss = s_w * style_loss(sty_ip_features)
+        loss = cnt_loss + sty_loss
+        loss.backward()
+
+        if i % 100 == 0:
+            print(f"Step - {i} Content: {cnt_loss.item():.4f}, Style: {sty_loss.item():.4f}, Total: {loss.item():.4f}")
+            save_debug_image(ip, i)
+            
         i += 1
+        return loss
+
+    while i < STEPS:
+        optimizer.step(step_closure)
+
+neural_style_transfer("golfinho.jpg", "steamboat_willie.jpg")

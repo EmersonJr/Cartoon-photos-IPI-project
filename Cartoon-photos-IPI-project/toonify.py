@@ -85,4 +85,4 @@ def toonifyReal(imagePath):
     plt.show()
 
 
-toonifyReal("Lenna.png")
+toonifyReal("specialTest.jpg")
